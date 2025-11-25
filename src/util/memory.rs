@@ -338,31 +338,14 @@ fn mmap_fixed(
 
     #[cfg(target_os = "windows")]
     {
-        use windows_sys::Win32::Foundation::{GetLastError, ERROR_INVALID_ADDRESS};
         use windows_sys::Win32::System::Memory::*;
 
         let ptr = start.to_mut_ptr();
         let prot = strategy.prot.into_native_flags();
+        let commit =
+            (flags & MAP_NORESERVE) == 0 && !matches!(strategy.prot, MmapProtection::NoAccess);
 
-        // Determine allocation type based on flags and protection
-        let mut allocation_type = MEM_RESERVE;
-        if (flags & MAP_NORESERVE) == 0 && !matches!(strategy.prot, MmapProtection::NoAccess) {
-            allocation_type |= MEM_COMMIT;
-        }
-
-        // We need to check the current state of the memory to decide how to proceed.
-        // VirtualAlloc has strict rules:
-        // - MEM_RESERVE fails if already reserved.
-        // - MEM_COMMIT fails if not reserved (unless MEM_RESERVE is also specified).
-        // - MEM_RESERVE requires 64K alignment.
-        // - MEM_COMMIT requires page alignment.
-
-        // Strategy:
-        // 1. Check state using VirtualQuery.
-        // 2. If Free: Must use MEM_RESERVE (+ MEM_COMMIT if needed).
-        // 3. If Reserved: Must use MEM_COMMIT (if needed). Cannot use MEM_RESERVE.
-        // 4. If Committed: Success (maybe change protection, but VirtualAlloc returns success).
-
+        // Query the state of the memory region
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let query_res = unsafe {
             VirtualQuery(
@@ -371,56 +354,41 @@ fn mmap_fixed(
                 std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
             )
         };
-
         if query_res == 0 {
             return Err(std::io::Error::last_os_error());
         }
 
-        let state = mbi.State;
-
-        // If the range spans multiple states, this logic is too simple.
-        // But MMTk usually manages memory in chunks where state is consistent.
-        // For robustness, let's try the logic that handles the most common cases.
-
-        // Check if we need to clean up existing mapping to allow new mapping (emulating MAP_FIXED overwrite).
-        // If we are at the start of an allocation (AllocationBase == ptr), we can release it to ensure we have a clean slate.
-        // This is crucial if we are replacing a small reservation (e.g. 4KB) with a larger one (e.g. 4MB),
-        // because we cannot simply extend a reservation on Windows.
-        if state != MEM_FREE && mbi.AllocationBase == ptr {
-            // We are replacing the existing block.
-            unsafe { VirtualFree(ptr, 0, MEM_RELEASE) };
-            // The state should now be MEM_FREE (assuming no race).
-        }
-
-        // Re-query state if we released? Or just assume it works.
-        // Safer to just try Alloc now.
-        // If we released, it is now Free. We use allocation_type (which includes Reserve if needed).
-        // If we didn't release (because we are in the middle of a chunk), we fall through to Commit-only logic.
-
         let res = unsafe {
-            // Try to allocate with original requested flags.
-            // If we just released, this works (Reserve+Commit).
-            // If we didn't release (middle of chunk), and we requested Reserve+Commit:
-            //   - VirtualAlloc(MEM_RESERVE | MEM_COMMIT) on already reserved memory might fail or succeed depending on exact state?
-            //   - MSDN says MEM_RESERVE fails if already reserved.
-            // So we must distinguish again.
-
-            let mut retry_commit_only = false;
-            let mut ptr_res = VirtualAlloc(ptr, size, allocation_type, prot);
-
-            if ptr_res.is_null() && (allocation_type & MEM_COMMIT) != 0 {
-                // If failed, and we wanted commit, maybe it's because it's already reserved and we shouldn't have passed MEM_RESERVE.
-                // (This happens if we are in the middle of a chunk).
-                let err = GetLastError();
-                if err == ERROR_INVALID_ADDRESS {
-                    retry_commit_only = true;
+            match mbi.State {
+                MEM_FREE => {
+                    let mut allocation_type = MEM_RESERVE;
+                    if commit {
+                        allocation_type |= MEM_COMMIT;
+                    }
+                    VirtualAlloc(ptr, size, allocation_type, prot)
+                }
+                MEM_RESERVE => {
+                    if commit {
+                        VirtualAlloc(ptr, size, MEM_COMMIT, prot)
+                    } else {
+                        // Already reserved, nothing to do
+                        ptr
+                    }
+                }
+                MEM_COMMIT => {
+                    // Already committed, just return success.
+                    // We could change protection here if needed, but VirtualAlloc returns success
+                    // if the memory is already committed.
+                    ptr
+                }
+                _ => {
+                    // Should not happen
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Unexpected memory state",
+                    ));
                 }
             }
-
-            if retry_commit_only {
-                ptr_res = VirtualAlloc(ptr, size, MEM_COMMIT, prot);
-            }
-            ptr_res
         };
 
         if res.is_null() {
@@ -439,40 +407,19 @@ pub fn munmap(start: Address, size: usize) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::System::Memory::*;
-        // MEM_RELEASE must be used with size 0 and the base address of the allocation.
-        // However, munmap can partial unmap.
-        // Windows VirtualFree MEM_RELEASE frees the entire block allocated by VirtualAlloc.
-        // Partial decommitment is possible with MEM_DECOMMIT.
-        // This is a known difference between mmap and VirtualAlloc.
-        // If MMTk expects partial unmapping, we are in trouble if we use MEM_RELEASE.
-        // But typically MMTk manages chunks.
-        // If we cannot free partially, we might leak address space if we only decommit.
-        // For now, let's try MEM_DECOMMIT which is safer for partials, but it leaves the address space reserved.
-        // OR we try MEM_RELEASE and hope we are freeing a whole block.
-        // Given MMTk's usage, it usually frees what it allocates (chunks).
-        // Let's use MEM_RELEASE if we can, but since we can't guarantee it's the base address,
-        // we might have to use MEM_DECOMMIT for partials or manage it better.
-
-        // NOTE: MMTk tends to allocate large chunks and carve them up.
-        // If munmap is called on a sub-range, we can only decommit.
-
-        let res = unsafe {
-            // We try to release. If it fails (e.g. because size is not 0), we act accordingly.
-            // Actually VirtualFree(addr, 0, MEM_RELEASE) releases the whole block.
-            // But we want to release `size` bytes.
-            // If we are strictly emulating munmap, we should probably just MEM_DECOMMIT.
-            // But that leaves the VA space used.
-            // For now, let's use MEM_DECOMMIT as a safe fallback for partials.
-            // Wait, if we use MEM_DECOMMIT, the pages become reserved but not accessible.
-            // If we want to truly free, we must use MEM_RELEASE on the base address.
-
-            // FIXME: This is a limitation on Windows. We use MEM_DECOMMIT which makes pages inaccessible.
-            // Future re-mapping with VirtualAlloc (MEM_COMMIT) should work on these reserved pages.
-            VirtualFree(start.to_mut_ptr(), size, MEM_DECOMMIT)
-        };
-
+        // Using MEM_DECOMMIT will decommit the memory but leave the address space reserved.
+        // This is the safest way to emulate munmap on Windows, as MEM_RELEASE would free
+        // the entire allocation, which could be larger than the requested size.
+        let res = unsafe { VirtualFree(start.to_mut_ptr(), size, MEM_DECOMMIT) };
         if res == 0 {
-            Err(std::io::Error::last_os_error())
+            // If decommit fails, we try to release the memory. This might happen if the memory was
+            // only reserved.
+            let res_release = unsafe { VirtualFree(start.to_mut_ptr(), 0, MEM_RELEASE) };
+            if res_release == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         } else {
             Ok(())
         }
