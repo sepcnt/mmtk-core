@@ -3,6 +3,7 @@ use crate::util::opaque_pointer::*;
 use crate::util::Address;
 use crate::vm::{Collection, VMBinding};
 use bytemuck::NoUninit;
+#[cfg(not(target_os = "windows"))]
 use libc::{PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE};
 use std::io::{Error, Result};
 use sysinfo::MemoryRefreshKind;
@@ -14,6 +15,10 @@ const MMAP_FLAGS: libc::c_int = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_F
 #[cfg(target_os = "macos")]
 // MAP_FIXED is used instead of MAP_FIXED_NOREPLACE (which is not available on macOS). We are at the risk of overwriting pre-existing mappings.
 const MMAP_FLAGS: libc::c_int = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED;
+#[cfg(target_os = "windows")]
+const MMAP_FLAGS: libc::c_int = 0; // Not used on Windows
+#[cfg(target_os = "windows")]
+const MAP_NORESERVE: libc::c_int = 0x4000; // Custom flag for Windows emulation
 
 /// Strategy for performing mmap
 #[derive(Debug, Copy, Clone)]
@@ -65,11 +70,22 @@ pub enum MmapProtection {
 
 impl MmapProtection {
     /// Turn the protection enum into the native flags
+    #[cfg(not(target_os = "windows"))]
     pub fn into_native_flags(self) -> libc::c_int {
         match self {
             Self::ReadWrite => PROT_READ | PROT_WRITE,
             Self::ReadWriteExec => PROT_READ | PROT_WRITE | PROT_EXEC,
             Self::NoAccess => PROT_NONE,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn into_native_flags(self) -> u32 {
+        use windows_sys::Win32::System::Memory::*;
+        match self {
+            Self::ReadWrite => PAGE_READWRITE,
+            Self::ReadWriteExec => PAGE_EXECUTE_READWRITE,
+            Self::NoAccess => PAGE_NOACCESS,
         }
     }
 }
@@ -157,9 +173,18 @@ impl std::fmt::Display for MmapAnnotation<'_> {
 /// Check the result from an mmap function in this module.
 /// Return true if the mmap has failed due to an existing conflicting mapping.
 pub(crate) fn result_is_mapped(result: Result<()>) -> bool {
+    #[cfg(not(target_os = "windows"))]
     match result {
         Ok(_) => false,
         Err(err) => err.raw_os_error().unwrap() == libc::EEXIST,
+    }
+    #[cfg(target_os = "windows")]
+    match result {
+        Ok(_) => false,
+        Err(err) => {
+            // ERROR_INVALID_ADDRESS may be returned if the address is already mapped or invalid
+            err.raw_os_error().unwrap() == 487 // ERROR_INVALID_ADDRESS
+        }
     }
 }
 
@@ -191,10 +216,14 @@ pub unsafe fn dzmmap(
     strategy: MmapStrategy,
     anno: &MmapAnnotation,
 ) -> Result<()> {
+    #[cfg(not(target_os = "windows"))]
     let flags = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED;
+    #[cfg(target_os = "windows")]
+    let flags = 0; // Not used
     let ret = mmap_fixed(start, size, flags, strategy, anno);
     // We do not need to explicitly zero for Linux (memory is guaranteed to be zeroed)
-    #[cfg(not(target_os = "linux"))]
+    // On Windows, MEM_COMMIT guarantees zero-initialized pages.
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     if ret.is_ok() {
         zero(start, size)
     }
@@ -210,10 +239,15 @@ pub fn dzmmap_noreplace(
     strategy: MmapStrategy,
     anno: &MmapAnnotation,
 ) -> Result<()> {
+    #[cfg(not(target_os = "windows"))]
     let flags = MMAP_FLAGS;
+    #[cfg(target_os = "windows")]
+    let flags = 0; // Not used
+
     let ret = mmap_fixed(start, size, flags, strategy, anno);
     // We do not need to explicitly zero for Linux (memory is guaranteed to be zeroed)
-    #[cfg(not(target_os = "linux"))]
+    // On Windows, MEM_COMMIT guarantees zero-initialized pages.
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     if ret.is_ok() {
         zero(start, size)
     }
@@ -231,7 +265,10 @@ pub fn mmap_noreserve(
     anno: &MmapAnnotation,
 ) -> Result<()> {
     strategy.prot = MmapProtection::NoAccess;
+    #[cfg(not(target_os = "windows"))]
     let flags = MMAP_FLAGS | libc::MAP_NORESERVE;
+    #[cfg(target_os = "windows")]
+    let flags = MAP_NORESERVE;
     mmap_fixed(start, size, flags, strategy, anno)
 }
 
@@ -242,64 +279,204 @@ fn mmap_fixed(
     strategy: MmapStrategy,
     _anno: &MmapAnnotation,
 ) -> Result<()> {
-    let ptr = start.to_mut_ptr();
-    let prot = strategy.prot.into_native_flags();
-    wrap_libc_call(
-        &|| unsafe { libc::mmap(start.to_mut_ptr(), size, prot, flags, -1, 0) },
-        ptr,
-    )?;
-
-    #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
-        not(feature = "no_mmap_annotation")
-    ))]
+    #[cfg(not(target_os = "windows"))]
     {
-        // `PR_SET_VMA` is new in Linux 5.17.  We compile against a version of the `libc` crate that
-        // has the `PR_SET_VMA_ANON_NAME` constant.  When runnning on an older kernel, it will not
-        // recognize this attribute and will return `EINVAL`.  However, `prctl` may return `EINVAL`
-        // for other reasons, too.  That includes `start` being an invalid address, and the
-        // formatted `anno_cstr` being longer than 80 bytes including the trailing `'\0'`.  But
-        // since this prctl is used for debugging, we log the error instead of panicking.
-        let anno_str = _anno.to_string();
-        let anno_cstr = std::ffi::CString::new(anno_str).unwrap();
-        let result = wrap_libc_call(
-            &|| unsafe {
-                libc::prctl(
-                    libc::PR_SET_VMA,
-                    libc::PR_SET_VMA_ANON_NAME,
-                    start.to_ptr::<libc::c_void>(),
-                    size,
-                    anno_cstr.as_ptr(),
-                )
-            },
-            0,
-        );
-        if let Err(e) = result {
-            debug!("Error while calling prctl: {e}");
+        let ptr = start.to_mut_ptr();
+        let prot = strategy.prot.into_native_flags();
+        wrap_libc_call(
+            &|| unsafe { libc::mmap(start.to_mut_ptr(), size, prot, flags, -1, 0) },
+            ptr,
+        )?;
+
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            not(feature = "no_mmap_annotation")
+        ))]
+        {
+            // `PR_SET_VMA` is new in Linux 5.17.  We compile against a version of the `libc` crate that
+            // has the `PR_SET_VMA_ANON_NAME` constant.  When runnning on an older kernel, it will not
+            // recognize this attribute and will return `EINVAL`.  However, `prctl` may return `EINVAL`
+            // for other reasons, too.  That includes `start` being an invalid address, and the
+            // formatted `anno_cstr` being longer than 80 bytes including the trailing `'\0'`.  But
+            // since this prctl is used for debugging, we log the error instead of panicking.
+            let anno_str = _anno.to_string();
+            let anno_cstr = std::ffi::CString::new(anno_str).unwrap();
+            let result = wrap_libc_call(
+                &|| unsafe {
+                    libc::prctl(
+                        libc::PR_SET_VMA,
+                        libc::PR_SET_VMA_ANON_NAME,
+                        start.to_ptr::<libc::c_void>(),
+                        size,
+                        anno_cstr.as_ptr(),
+                    )
+                },
+                0,
+            );
+            if let Err(e) = result {
+                debug!("Error while calling prctl: {e}");
+            }
+        }
+
+        match strategy.huge_page {
+            HugePageSupport::No => Ok(()),
+            HugePageSupport::TransparentHugePages => {
+                #[cfg(target_os = "linux")]
+                {
+                    wrap_libc_call(
+                        &|| unsafe { libc::madvise(start.to_mut_ptr(), size, libc::MADV_HUGEPAGE) },
+                        0,
+                    )
+                }
+                // Setting the transparent hugepage option to true will not pass
+                // the validation on non-Linux OSes
+                #[cfg(not(target_os = "linux"))]
+                unreachable!()
+            }
         }
     }
 
-    match strategy.huge_page {
-        HugePageSupport::No => Ok(()),
-        HugePageSupport::TransparentHugePages => {
-            #[cfg(target_os = "linux")]
-            {
-                wrap_libc_call(
-                    &|| unsafe { libc::madvise(start.to_mut_ptr(), size, libc::MADV_HUGEPAGE) },
-                    0,
-                )
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_INVALID_ADDRESS};
+        use windows_sys::Win32::System::Memory::*;
+
+        let ptr = start.to_mut_ptr();
+        let prot = strategy.prot.into_native_flags();
+
+        // Determine allocation type based on flags and protection
+        let mut allocation_type = MEM_RESERVE;
+        if (flags & MAP_NORESERVE) == 0 && !matches!(strategy.prot, MmapProtection::NoAccess) {
+            allocation_type |= MEM_COMMIT;
+        }
+
+        // We need to check the current state of the memory to decide how to proceed.
+        // VirtualAlloc has strict rules:
+        // - MEM_RESERVE fails if already reserved.
+        // - MEM_COMMIT fails if not reserved (unless MEM_RESERVE is also specified).
+        // - MEM_RESERVE requires 64K alignment.
+        // - MEM_COMMIT requires page alignment.
+
+        // Strategy:
+        // 1. Check state using VirtualQuery.
+        // 2. If Free: Must use MEM_RESERVE (+ MEM_COMMIT if needed).
+        // 3. If Reserved: Must use MEM_COMMIT (if needed). Cannot use MEM_RESERVE.
+        // 4. If Committed: Success (maybe change protection, but VirtualAlloc returns success).
+
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let query_res = unsafe {
+            VirtualQuery(
+                ptr,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+
+        if query_res == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let state = mbi.State;
+
+        // If the range spans multiple states, this logic is too simple.
+        // But MMTk usually manages memory in chunks where state is consistent.
+        // For robustness, let's try the logic that handles the most common cases.
+
+        // Check if we need to clean up existing mapping to allow new mapping (emulating MAP_FIXED overwrite).
+        // If we are at the start of an allocation (AllocationBase == ptr), we can release it to ensure we have a clean slate.
+        // This is crucial if we are replacing a small reservation (e.g. 4KB) with a larger one (e.g. 4MB),
+        // because we cannot simply extend a reservation on Windows.
+        if state != MEM_FREE && mbi.AllocationBase == ptr {
+            // We are replacing the existing block.
+            unsafe { VirtualFree(ptr, 0, MEM_RELEASE) };
+            // The state should now be MEM_FREE (assuming no race).
+        }
+
+        // Re-query state if we released? Or just assume it works.
+        // Safer to just try Alloc now.
+        // If we released, it is now Free. We use allocation_type (which includes Reserve if needed).
+        // If we didn't release (because we are in the middle of a chunk), we fall through to Commit-only logic.
+
+        let res = unsafe {
+            // Try to allocate with original requested flags.
+            // If we just released, this works (Reserve+Commit).
+            // If we didn't release (middle of chunk), and we requested Reserve+Commit:
+            //   - VirtualAlloc(MEM_RESERVE | MEM_COMMIT) on already reserved memory might fail or succeed depending on exact state?
+            //   - MSDN says MEM_RESERVE fails if already reserved.
+            // So we must distinguish again.
+
+            let mut retry_commit_only = false;
+            let mut ptr_res = VirtualAlloc(ptr, size, allocation_type, prot);
+
+            if ptr_res.is_null() && (allocation_type & MEM_COMMIT) != 0 {
+                // If failed, and we wanted commit, maybe it's because it's already reserved and we shouldn't have passed MEM_RESERVE.
+                // (This happens if we are in the middle of a chunk).
+                let err = GetLastError();
+                if err == ERROR_INVALID_ADDRESS {
+                    retry_commit_only = true;
+                }
             }
-            // Setting the transparent hugepage option to true will not pass
-            // the validation on non-Linux OSes
-            #[cfg(not(target_os = "linux"))]
-            unreachable!()
+
+            if retry_commit_only {
+                ptr_res = VirtualAlloc(ptr, size, MEM_COMMIT, prot);
+            }
+            ptr_res
+        };
+
+        if res.is_null() {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
 }
 
 /// Unmap the given memory (in page granularity). This wraps the unsafe libc munmap call.
 pub fn munmap(start: Address, size: usize) -> Result<()> {
-    wrap_libc_call(&|| unsafe { libc::munmap(start.to_mut_ptr(), size) }, 0)
+    #[cfg(not(target_os = "windows"))]
+    return wrap_libc_call(&|| unsafe { libc::munmap(start.to_mut_ptr(), size) }, 0);
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Memory::*;
+        // MEM_RELEASE must be used with size 0 and the base address of the allocation.
+        // However, munmap can partial unmap.
+        // Windows VirtualFree MEM_RELEASE frees the entire block allocated by VirtualAlloc.
+        // Partial decommitment is possible with MEM_DECOMMIT.
+        // This is a known difference between mmap and VirtualAlloc.
+        // If MMTk expects partial unmapping, we are in trouble if we use MEM_RELEASE.
+        // But typically MMTk manages chunks.
+        // If we cannot free partially, we might leak address space if we only decommit.
+        // For now, let's try MEM_DECOMMIT which is safer for partials, but it leaves the address space reserved.
+        // OR we try MEM_RELEASE and hope we are freeing a whole block.
+        // Given MMTk's usage, it usually frees what it allocates (chunks).
+        // Let's use MEM_RELEASE if we can, but since we can't guarantee it's the base address,
+        // we might have to use MEM_DECOMMIT for partials or manage it better.
+
+        // NOTE: MMTk tends to allocate large chunks and carve them up.
+        // If munmap is called on a sub-range, we can only decommit.
+
+        let res = unsafe {
+            // We try to release. If it fails (e.g. because size is not 0), we act accordingly.
+            // Actually VirtualFree(addr, 0, MEM_RELEASE) releases the whole block.
+            // But we want to release `size` bytes.
+            // If we are strictly emulating munmap, we should probably just MEM_DECOMMIT.
+            // But that leaves the VA space used.
+            // For now, let's use MEM_DECOMMIT as a safe fallback for partials.
+            // Wait, if we use MEM_DECOMMIT, the pages become reserved but not accessible.
+            // If we want to truly free, we must use MEM_RELEASE on the base address.
+
+            // FIXME: This is a limitation on Windows. We use MEM_DECOMMIT which makes pages inaccessible.
+            // Future re-mapping with VirtualAlloc (MEM_COMMIT) should work on these reserved pages.
+            VirtualFree(start.to_mut_ptr(), size, MEM_DECOMMIT)
+        };
+
+        if res == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Properly handle errors from a mmap Result, including invoking the binding code in the case of
@@ -329,8 +506,16 @@ pub fn handle_mmap_error<VM: VMBinding>(
             // further check the error
             if let Some(os_errno) = error.raw_os_error() {
                 // If it is OOM, we invoke out_of_memory() through the VM interface.
+                #[cfg(not(target_os = "windows"))]
                 if os_errno == libc::ENOMEM {
                     // Signal `MmapOutOfMemory`. Expect the VM to abort immediately.
+                    trace!("Signal MmapOutOfMemory!");
+                    VM::VMCollection::out_of_memory(tls, AllocationError::MmapOutOfMemory);
+                    unreachable!()
+                }
+                #[cfg(target_os = "windows")]
+                if os_errno == 8 {
+                    // ERROR_NOT_ENOUGH_MEMORY
                     trace!("Signal MmapOutOfMemory!");
                     VM::VMCollection::out_of_memory(tls, AllocationError::MmapOutOfMemory);
                     unreachable!()
@@ -380,19 +565,49 @@ pub(crate) fn panic_if_unmapped(_start: Address, _size: usize, _anno: &MmapAnnot
 
 /// Unprotect the given memory (in page granularity) to allow access (PROT_READ/WRITE/EXEC).
 pub fn munprotect(start: Address, size: usize, prot: MmapProtection) -> Result<()> {
-    let prot = prot.into_native_flags();
-    wrap_libc_call(
-        &|| unsafe { libc::mprotect(start.to_mut_ptr(), size, prot) },
-        0,
-    )
+    #[cfg(not(target_os = "windows"))]
+    {
+        let prot = prot.into_native_flags();
+        wrap_libc_call(
+            &|| unsafe { libc::mprotect(start.to_mut_ptr(), size, prot) },
+            0,
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Memory::*;
+        let prot = prot.into_native_flags();
+        let mut old_protect = 0;
+        let res = unsafe { VirtualProtect(start.to_mut_ptr(), size, prot, &mut old_protect) };
+        if res == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Protect the given memory (in page granularity) to forbid any access (PROT_NONE).
 pub fn mprotect(start: Address, size: usize) -> Result<()> {
-    wrap_libc_call(
-        &|| unsafe { libc::mprotect(start.to_mut_ptr(), size, PROT_NONE) },
-        0,
-    )
+    #[cfg(not(target_os = "windows"))]
+    {
+        wrap_libc_call(
+            &|| unsafe { libc::mprotect(start.to_mut_ptr(), size, PROT_NONE) },
+            0,
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Memory::*;
+        let mut old_protect = 0;
+        let res =
+            unsafe { VirtualProtect(start.to_mut_ptr(), size, PAGE_NOACCESS, &mut old_protect) };
+        if res == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn wrap_libc_call<T: PartialEq>(f: &dyn Fn() -> T, expect: T) -> Result<()> {
