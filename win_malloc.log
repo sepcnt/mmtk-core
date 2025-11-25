@@ -1,2 +1,0 @@
-[win_malloc] posix_memalign: alignment=32, size=16
-[win_malloc] posix_memalign: alignment > 16, returning EINVAL
