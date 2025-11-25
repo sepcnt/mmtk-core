@@ -73,60 +73,71 @@ mod libc_malloc {
     pub use self::malloc_size as malloc_usable_size;
 }
 
-/// Windows malloc implementation from ucrt
-#[cfg(all(
-    target_os = "windows",
-    not(any(feature = "malloc_jemalloc", feature = "malloc_mimalloc"))
-))]
+/// Windows malloc implementation using HeapAlloc
+#[cfg(target_os = "windows")]
 mod win_malloc {
     // Normal 4K page
     pub const LOG_BYTES_IN_MALLOC_PAGE: u8 = crate::util::constants::LOG_BYTES_IN_PAGE;
 
-    extern "C" {
-        fn _aligned_malloc(size: usize, alignment: usize) -> *mut std::ffi::c_void;
-        fn _aligned_free(ptr: *mut std::ffi::c_void);
-        fn _msize(ptr: *mut std::ffi::c_void) -> usize;
-        fn _aligned_realloc(ptr: *mut std::ffi::c_void, size: usize, alignment: usize) -> *mut std::ffi::c_void;
-    }
+    use std::ffi::c_void;
+    use windows_sys::Win32::System::Memory::*;
 
     // All allocations must be 16-byte aligned on Windows for SSE instructions.
     const MALLOC_ALIGNMENT: usize = 16;
 
-    pub unsafe fn malloc(size: usize) -> *mut std::ffi::c_void {
-        _aligned_malloc(size, MALLOC_ALIGNMENT)
+    pub unsafe fn malloc(size: usize) -> *mut c_void {
+        let mut ptr = std::ptr::null_mut();
+        posix_memalign(&mut ptr, MALLOC_ALIGNMENT, size);
+        ptr
     }
 
-    pub unsafe fn calloc(nmemb: usize, size: usize) -> *mut std::ffi::c_void {
+    pub unsafe fn free(ptr: *mut c_void) {
+        if !ptr.is_null() {
+            let original_ptr = *(ptr as *mut *mut c_void).offset(-1);
+            HeapFree(GetProcessHeap(), 0, original_ptr);
+        }
+    }
+
+    pub unsafe fn calloc(nmemb: usize, size: usize) -> *mut c_void {
         let total = nmemb * size;
-        let ptr = _aligned_malloc(total, MALLOC_ALIGNMENT);
+        let ptr = malloc(total);
         if !ptr.is_null() {
             std::ptr::write_bytes(ptr, 0, total);
         }
         ptr
     }
 
-    pub unsafe fn realloc(ptr: *mut std::ffi::c_void, size: usize) -> *mut std::ffi::c_void {
-        _aligned_realloc(ptr, size, MALLOC_ALIGNMENT)
-    }
-
-    pub unsafe fn free(ptr: *mut std::ffi::c_void) {
-        _aligned_free(ptr)
-    }
-
-    pub unsafe fn posix_memalign(
-        memptr: *mut *mut std::ffi::c_void,
-        alignment: usize,
-        size: usize,
-    ) -> i32 {
-        let ptr = _aligned_malloc(size, alignment);
+    pub unsafe fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
         if ptr.is_null() {
+            return malloc(size);
+        }
+        let original_ptr = *(ptr as *mut *mut c_void).offset(-1);
+        let new_ptr = HeapReAlloc(GetProcessHeap(), 0, original_ptr, size + MALLOC_ALIGNMENT);
+        if new_ptr.is_null() {
+            return std::ptr::null_mut();
+        }
+        let aligned_ptr = (new_ptr as usize + MALLOC_ALIGNMENT - 1) & !(MALLOC_ALIGNMENT - 1);
+        *(aligned_ptr as *mut *mut c_void).offset(-1) = new_ptr;
+        aligned_ptr as *mut c_void
+    }
+
+    pub unsafe fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> i32 {
+        let total_size = size + alignment + std::mem::size_of::<*mut c_void>();
+        let original_ptr = HeapAlloc(GetProcessHeap(), 0, total_size);
+        if original_ptr.is_null() {
             return 12; // ENOMEM
         }
-        *memptr = ptr;
+        let aligned_ptr = (original_ptr as usize + alignment + std::mem::size_of::<*mut c_void>() - 1) & !(alignment - 1);
+        *(aligned_ptr as *mut *mut c_void).offset(-1) = original_ptr;
+        *memptr = aligned_ptr as *mut c_void;
         0
     }
 
-    pub unsafe fn malloc_usable_size(ptr: *mut std::ffi::c_void) -> usize {
-        _msize(ptr)
+    pub unsafe fn malloc_usable_size(ptr: *const c_void) -> usize {
+        if ptr.is_null() {
+            return 0;
+        }
+        let original_ptr = *(ptr as *mut *const c_void).offset(-1);
+        HeapSize(GetProcessHeap(), 0, original_ptr)
     }
 }
