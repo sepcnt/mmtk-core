@@ -73,61 +73,83 @@ mod libc_malloc {
     pub use self::malloc_size as malloc_usable_size;
 }
 
-/// Windows malloc implementation using HeapAlloc
+/// Windows malloc implementation using HeapAlloc with manual alignment
 #[cfg(target_os = "windows")]
 mod win_malloc {
     // Normal 4K page
     pub const LOG_BYTES_IN_MALLOC_PAGE: u8 = crate::util::constants::LOG_BYTES_IN_PAGE;
 
     use std::ffi::c_void;
+    use std::ptr;
     use windows_sys::Win32::System::Memory::*;
 
-    pub unsafe fn malloc(size: usize) -> *mut c_void {
-        HeapAlloc(GetProcessHeap(), 0, size)
+    // All allocations must be 16-byte aligned on Windows for SSE instructions.
+    const MALLOC_ALIGNMENT: usize = 16;
+
+    pub unsafe fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> i32 {
+        let total_size = size + alignment + std::mem::size_of::<*mut c_void>();
+        let original_ptr = HeapAlloc(GetProcessHeap(), 0, total_size);
+
+        if original_ptr.is_null() {
+            return 12; // ENOMEM
+        }
+
+        let aligned_offset =
+            (original_ptr as usize + std::mem::size_of::<*mut c_void>() + alignment - 1)
+                & !(alignment - 1);
+        let aligned_ptr = aligned_offset as *mut c_void;
+
+        *((aligned_ptr as *mut *mut c_void).offset(-1)) = original_ptr;
+        *memptr = aligned_ptr;
+        0
     }
 
     pub unsafe fn free(ptr: *mut c_void) {
         if !ptr.is_null() {
-            HeapFree(GetProcessHeap(), 0, ptr);
+            let original_ptr = *((ptr as *mut *mut c_void).offset(-1));
+            HeapFree(GetProcessHeap(), 0, original_ptr);
         }
     }
 
+    pub unsafe fn malloc(size: usize) -> *mut c_void {
+        let mut ptr = ptr::null_mut();
+        posix_memalign(&mut ptr, MALLOC_ALIGNMENT, size);
+        ptr
+    }
+
     pub unsafe fn calloc(nmemb: usize, size: usize) -> *mut c_void {
-        let total = nmemb * size;
-        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, total)
+        let total_size = nmemb * size;
+        let ptr = malloc(total_size);
+        if !ptr.is_null() {
+            ptr::write_bytes(ptr, 0, total_size);
+        }
+        ptr
     }
 
     pub unsafe fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
         if ptr.is_null() {
             return malloc(size);
         }
-        HeapReAlloc(GetProcessHeap(), 0, ptr, size)
-    }
-
-    pub unsafe fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> i32 {
-        // Windows HeapAlloc usually guarantees 16-byte alignment on 64-bit systems.
-        // If the requested alignment is larger than that, we cannot satisfy it using standard HeapAlloc
-        // without complex wrapping (which would require a custom free).
-        // For now, we return EINVAL if the alignment is too large, rather than returning misaligned memory.
-        if alignment > 16 {
-            return 22; // EINVAL
-        }
-
-        let ptr = malloc(size);
-        if ptr.is_null() {
-            return 12; // ENOMEM
-        }
-        // Double check alignment
-        if (ptr as usize) % alignment != 0 {
-            // Should not happen for alignment <= 16 on 64-bit Windows usually.
+        if size == 0 {
             free(ptr);
-            return 22; // EINVAL
+            return ptr::null_mut();
         }
-        *memptr = ptr;
-        0
+
+        let new_ptr = malloc(size);
+        if !new_ptr.is_null() {
+            let old_size = malloc_usable_size(ptr);
+            let copy_size = if old_size < size { old_size } else { size };
+            ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+            free(ptr);
+        }
+        new_ptr
     }
 
     pub unsafe fn malloc_usable_size(ptr: *const c_void) -> usize {
-        HeapSize(GetProcessHeap(), 0, ptr)
+        if ptr.is_null() {
+            return 0;
+        }
+        let original_ptr = *((ptr as *mut *const c_void).offset(-1));
+        HeapSize(GetProcessHeap(), 0, original_ptr)
     }
 }
