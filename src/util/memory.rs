@@ -459,8 +459,8 @@ pub fn handle_mmap_error<VM: VMBinding>(
                     unreachable!()
                 }
                 #[cfg(target_os = "windows")]
-                if os_errno == 8 {
-                    // ERROR_NOT_ENOUGH_MEMORY
+                if os_errno == 8 || os_errno == 487 {
+                    // ERROR_NOT_ENOUGH_MEMORY or ERROR_INVALID_ADDRESS
                     trace!("Signal MmapOutOfMemory!");
                     VM::VMCollection::out_of_memory(tls, AllocationError::MmapOutOfMemory);
                     unreachable!()
