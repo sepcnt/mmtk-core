@@ -101,6 +101,7 @@ fn simple_spawn_gc_thread(
 /// Test the `initialize_collection` function with actual running GC threads, and the functions for
 /// supporting forking.
 #[test]
+#[cfg(not(target_os = "windows"))]
 pub fn test_initialize_collection_and_fork() {
     // We don't use fixtures or `with_mockvm` because we want to precisely control the
     // initialization process.
@@ -194,4 +195,35 @@ pub fn test_initialize_collection_and_fork() {
     }
 
     println!("All GC worker threads are up and running.");
+}
+
+#[test]
+#[cfg(target_os = "windows")]
+pub fn test_initialize_collection_and_fork() {
+    // A simplified test for Windows that does not call fork, but tests the GC thread
+    // shutdown and restart logic.
+    let mut builder = MMTKBuilder::new();
+    let trigger = GCTriggerSelector::FixedHeapSize(1024 * 1024);
+    builder.options.gc_trigger.set(trigger);
+    builder.options.threads.set(NUM_WORKER_THREADS);
+    let mmtk: &'static mut MMTK<MockVM> = Box::leak(Box::new(builder.build::<MockVM>()));
+
+    let mock_vm = MockVM {
+        spawn_gc_thread: MockMethod::new_fixed(Box::new(|(vm_thread, context)| {
+            simple_spawn_gc_thread(vm_thread, context, mmtk)
+        })),
+        ..Default::default()
+    };
+    write_mockvm(move |mock_vm_ref| *mock_vm_ref = mock_vm);
+
+    let test_thread_tls = VMThread(OpaquePointer::from_address(Address::ZERO));
+
+    // Initialize collection.
+    mmtk.initialize_collection(test_thread_tls);
+
+    // Stop GC threads.
+    mmtk.prepare_to_fork();
+
+    // Restart GC threads.
+    mmtk.after_fork(test_thread_tls);
 }
