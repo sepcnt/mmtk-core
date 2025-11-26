@@ -74,7 +74,10 @@ mod libc_malloc {
 }
 
 /// Windows malloc implementation using HeapAlloc
-#[cfg(target_os = "windows")]
+#[cfg(all(
+    target_os = "windows",
+    not(any(feature = "malloc_jemalloc", feature = "malloc_mimalloc"))
+))]
 mod win_malloc {
     // Normal 4K page
     pub const LOG_BYTES_IN_MALLOC_PAGE: u8 = crate::util::constants::LOG_BYTES_IN_PAGE;
