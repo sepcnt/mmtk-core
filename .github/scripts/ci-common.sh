@@ -10,8 +10,20 @@ cargo_toml=$project_root/Cargo.toml
 dummyvm_toml=$project_root/docs/dummyvm/Cargo.toml
 
 # Pin certain deps for our MSRV
-cargo update -p home@0.5.11 --precise 0.5.5 # This can be removed once we move to Rust 1.81 or newer
 cargo update -p home@0.5.12 --precise 0.5.5 # This requires Rust edition 2024
+
+# Read a line and strip trailing CR (works for CRLF and LF files)
+strip_cr() {
+  local s=$1
+  printf '%s' "${s%$'\r'}"
+}
+
+# Trim all whitespace (for feature keys)
+trim_ws() {
+  local s=$1
+  # remove all whitespace characters
+  printf '%s' "${s//[[:space:]]/}"
+}
 
 # Repeat a command for all the features. Requires the command as one argument (with double quotes)
 for_all_features() {
@@ -47,6 +59,8 @@ init_non_exclusive_features() {
     i=0
 
     while IFS= read -r line; do
+        line=$(strip_cr "$line")
+
         # Only parse non mutally exclusive features
         if [[ $line == *"-- Non mutually exclusive features --"* ]]; then
             parse_features=true
@@ -67,13 +81,20 @@ init_non_exclusive_features() {
             IFS='='; feature=($line); unset IFS;
             if [[ ! -z "$feature" ]]; then
                 # Trim whitespaces
-                features[i]=$(echo $feature)
+                feature_name=$(trim_ws "$feature")
+                # jemalloc does not support Windows
+                if [[ $os == "windows" && $feature_name == "malloc_jemalloc" ]]; then
+                    continue
+                fi
+                features[i]=$feature_name
                 let "i++"
             fi
         fi
     done < $cargo_toml
 
     non_exclusive_features=$(IFS=$','; echo "${features[*]}")
+
+    echo "Non exclusive features: $non_exclusive_features"
 }
 
 # Get exclusive features
@@ -89,6 +110,8 @@ init_exclusive_features() {
     declare -a features=()
 
     while IFS= read -r line; do
+        line=$(strip_cr "$line")
+
         # Only parse mutally exclusive features
         if [[ $line == *"-- Mutally exclusive features --"* ]]; then
             parse_features=true
@@ -117,7 +140,12 @@ init_exclusive_features() {
             IFS='='; feature=($line); unset IFS;
             if [[ ! -z "$feature" ]]; then
                 # Trim whitespaces
-                features[i]=$(echo $feature)
+                feature_name=$(trim_ws "$feature")
+                # jemalloc does not support Windows
+                if [[ $os == "windows" && $feature_name == "malloc_jemalloc" ]]; then
+                    continue
+                fi
+                features[i]=$feature_name
                 let "i++"
             fi
         fi
